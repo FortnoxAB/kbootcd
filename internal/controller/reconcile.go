@@ -11,6 +11,7 @@ import (
 
 	"github.com/elliot-gustafsson/kbootcd/internal/command"
 	"github.com/elliot-gustafsson/kbootcd/internal/host"
+	"github.com/elliot-gustafsson/kbootcd/internal/notify"
 	"github.com/elliot-gustafsson/kbootcd/internal/slogwriter"
 	"github.com/google/go-containerregistry/pkg/name"
 	"k8s.io/apimachinery/pkg/types"
@@ -52,6 +53,8 @@ type Config struct {
 	LeaseDuration         time.Duration
 	RebootDelay           time.Duration
 	CooldownDelay         time.Duration
+	SlackToken            string
+	SlackChannel          string
 	Clock                 clock.PassiveClock
 	Window                Window
 }
@@ -137,6 +140,7 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 			if err != nil {
 				return fmt.Errorf("failed uncordoning node, err: %w", err)
 			}
+			notifySlack(ctx, logger, config, fmt.Sprintf("Node %s rebooted & uncordoned successfully!", config.NodeName))
 
 			err = finalizeLeaseState(ctx, logger, kube, lease, config)
 			if err != nil {
@@ -174,11 +178,13 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 		return nil
 	}
 
+	notifySlack(ctx, logger, config, fmt.Sprintf("Draining node %s", config.NodeName))
 	if err := drainNode(ctx, logger, kube, lease, config); err != nil {
 		return fmt.Errorf("error draining node, err: %w", err)
 	}
 
 	logger.Info("workload eviction finalized, issuing reboot...")
+	notifySlack(ctx, logger, config, fmt.Sprintf("Rebooting node %s", config.NodeName))
 
 	if config.RebootDelay > 0 {
 		logger.Info("delaying reboot for " + config.RebootDelay.String())
@@ -224,6 +230,16 @@ func waitForNodeReady(ctx context.Context, kube kubernetes.Interface, nodeName s
 		case <-ticker.C:
 			continue
 		}
+	}
+}
+
+// notifySlack posts when a token is configured; failures are logged and never block the upgrade
+func notifySlack(ctx context.Context, logger *slog.Logger, config Config, text string) {
+	if config.SlackToken == "" {
+		return
+	}
+	if err := notify.Slack(ctx, config.SlackToken, config.SlackChannel, text); err != nil {
+		logger.Error("error posting to slack", "error", err.Error())
 	}
 }
 

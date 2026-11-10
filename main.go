@@ -139,6 +139,8 @@ func run(ctx context.Context) error {
 		LeaseDuration:         leaseDuration,
 		RebootDelay:           rebootDelay,
 		CooldownDelay:         cooldownDelay,
+		SlackToken:            os.Getenv("SLACK_TOKEN"),
+		SlackChannel:          os.Getenv("SLACK_CHANNEL"),
 	}
 
 	config.Window, err = controller.BuildTimeWindow(rebootStart, rebootEnd, rebootDays, timezone)
@@ -147,6 +149,12 @@ func run(ctx context.Context) error {
 	}
 
 	slog.Info("Starting kbootcd", "node", nodeName, "interval", tickerInterval.String())
+	if config.SlackToken != "" && config.SlackChannel == "" {
+		return fmt.Errorf("SLACK_CHANNEL must be set when SLACK_TOKEN is set")
+	}
+	if config.SlackToken != "" {
+		slog.Info("slack notifications enabled", "channel", config.SlackChannel)
+	}
 
 	cmder := command.NewCommander()
 	// Run immediate baseline check on startup
