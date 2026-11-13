@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -584,11 +585,90 @@ func TestReconcileNotifiesSlack(t *testing.T) {
 
 	err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
 	assert.NoError(t, err)
-	assert.Equal(t, []string{`{"channel":"#kbootcd","text":"Node test001 rebooted \u0026 uncordoned successfully!","username":"kbootcd"}`}, *posts)
+	assert.Equal(t, []string{`{"channel":"#kbootcd","text":"Node test001 uncordoned successfully!","username":"kbootcd"}`}, *posts)
 
 	node, err := kubeMockClient.CoreV1().Nodes().Get(context.Background(), "test001", metav1.GetOptions{})
 	assert.NoError(t, err)
 	assert.False(t, node.Spec.Unschedulable)
+}
+
+func TestReconcileSkipsSlackWhenAlreadyUncordoned(t *testing.T) {
+	posts := newSlackServer(t)
+
+	mockCmder := mock_command.NewMockCommander(t)
+
+	holder := "test001"
+	objects := []runtime.Object{
+		&corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "test001"},
+			Spec:       corev1.NodeSpec{Unschedulable: false},
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{{
+					Type:   corev1.NodeReady,
+					Status: corev1.ConditionTrue,
+				}},
+			},
+		},
+		&coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{Name: "bootc-upgrade-lock-test", Namespace: "test"},
+			Spec:       coordinationv1.LeaseSpec{HolderIdentity: &holder},
+		},
+	}
+	kubeMockClient := fake.NewSimpleClientset(objects...)
+
+	mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
+		Once().
+		Return(toJson(t, MockBootcHost), nil)
+
+	config := NewTestConfig("test001", time.Now())
+	config.SlackToken, config.SlackChannel = "xoxb-test", "#kbootcd"
+	tImage := "registry.example.com/os:v2.1.0@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	config.TargetImageConfigPath = createTempFile(t, tImage)
+
+	err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
+	assert.NoError(t, err)
+	assert.Empty(t, *posts)
+}
+
+func TestReconcileNotifiesSlackOnRebootFailure(t *testing.T) {
+	posts := newSlackServer(t)
+
+	mockCmder := mock_command.NewMockCommander(t)
+
+	kubeMockClient := fake.NewSimpleClientset(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "test001"},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{{
+				Type:   corev1.NodeReady,
+				Status: corev1.ConditionTrue,
+			}},
+		},
+	})
+
+	bootcStatus := MockBootcHost
+	bootcStatus.Status.Staged = &MockStagedState
+
+	mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
+		Once().
+		Return(toJson(t, bootcStatus), nil)
+
+	mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "systemctl", "reboot")).
+		Once().
+		Return(nil, errors.New("boom"))
+
+	config := NewTestConfig("test001", time.Now())
+	config.SlackToken, config.SlackChannel = "xoxb-test", "#kbootcd"
+	tImage := "registry.example.com/os:v2.1.0@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+	config.TargetImageConfigPath = createTempFile(t, tImage)
+
+	err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
+	assert.Error(t, err)
+	assert.NotErrorIs(t, err, ErrRebootInitiated)
+	assert.Equal(t, []string{
+		`{"channel":"#kbootcd","text":"Draining node test001","username":"kbootcd"}`,
+		`{"channel":"#kbootcd","text":"Rebooting node test001","username":"kbootcd"}`,
+		`{"channel":"#kbootcd","text":"Reboot of node test001 failed: boom","username":"kbootcd"}`,
+	}, *posts)
 }
 
 // ##########################################

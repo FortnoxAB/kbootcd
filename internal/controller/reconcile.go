@@ -136,11 +136,13 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 		// Only run cleanup if we're leader
 		if lease != nil && lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity == config.NodeName {
 
-			err := ensureUncordoned(ctx, logger, kube, config)
+			uncordoned, err := ensureUncordoned(ctx, logger, kube, config)
 			if err != nil {
 				return fmt.Errorf("failed uncordoning node, err: %w", err)
 			}
-			notifySlack(ctx, logger, config, fmt.Sprintf("Node %s rebooted & uncordoned successfully!", config.NodeName))
+			if uncordoned {
+				notifySlack(ctx, logger, config, fmt.Sprintf("Node %s uncordoned successfully!", config.NodeName))
+			}
 
 			err = finalizeLeaseState(ctx, logger, kube, lease, config)
 			if err != nil {
@@ -184,15 +186,16 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 	}
 
 	logger.Info("workload eviction finalized, issuing reboot...")
-	notifySlack(ctx, logger, config, fmt.Sprintf("Rebooting node %s", config.NodeName))
 
 	if config.RebootDelay > 0 {
 		logger.Info("delaying reboot for " + config.RebootDelay.String())
 		time.Sleep(config.RebootDelay)
 	}
 
+	notifySlack(ctx, logger, config, fmt.Sprintf("Rebooting node %s", config.NodeName))
 	err = host.Reboot(ctx, cmder)
 	if err != nil {
+		notifySlack(ctx, logger, config, fmt.Sprintf("Reboot of node %s failed: %s", config.NodeName, err))
 		return fmt.Errorf("failed to issue reboot command: %w", err)
 	}
 
@@ -238,6 +241,8 @@ func notifySlack(ctx context.Context, logger *slog.Logger, config Config, text s
 	if config.SlackToken == "" {
 		return
 	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	if err := notify.Slack(ctx, config.SlackToken, config.SlackChannel, text); err != nil {
 		logger.Error("error posting to slack", "error", err.Error())
 	}
@@ -367,19 +372,23 @@ func drainNode(ctx context.Context, logger *slog.Logger, kube kubernetes.Interfa
 }
 
 // ensureUncordoned updates base status payloads to resume scheduler tracking
-func ensureUncordoned(ctx context.Context, logger *slog.Logger, kube kubernetes.Interface, config Config) error {
+// and reports whether the node was actually uncordoned
+func ensureUncordoned(ctx context.Context, logger *slog.Logger, kube kubernetes.Interface, config Config) (bool, error) {
 	node, err := kube.CoreV1().Nodes().Get(ctx, config.NodeName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to get node status: %w", err)
+		return false, fmt.Errorf("failed to get node status: %w", err)
 	}
 	if !node.Spec.Unschedulable {
 		// Node is already uncordoned
-		return nil
+		return false, nil
 	}
 	logger.Info("target state validated. uncordoning node...")
 	patch := []byte(`{"spec":{"unschedulable":false}}`)
 	_, err = kube.CoreV1().Nodes().Patch(ctx, config.NodeName, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
-	return err
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func getLease(ctx context.Context, kube kubernetes.Interface, config Config) (*coordinationv1.Lease, error) {
