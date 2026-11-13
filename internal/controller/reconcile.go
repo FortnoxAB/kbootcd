@@ -53,6 +53,7 @@ type Config struct {
 	LeaseDuration         time.Duration
 	RebootDelay           time.Duration
 	CooldownDelay         time.Duration
+	DrainTimeout          time.Duration
 	SlackToken            string
 	SlackChannel          string
 	Clock                 clock.PassiveClock
@@ -182,6 +183,7 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 
 	notifySlack(ctx, logger, config, fmt.Sprintf("Draining node %s", config.NodeName))
 	if err := drainNode(ctx, logger, kube, lease, config); err != nil {
+		notifySlack(ctx, logger, config, fmt.Sprintf("Drain of node %s failed: %s", config.NodeName, err))
 		return fmt.Errorf("error draining node, err: %w", err)
 	}
 
@@ -354,6 +356,7 @@ func drainNode(ctx context.Context, logger *slog.Logger, kube kubernetes.Interfa
 		GracePeriodSeconds:  -1,   // Honors user-configured workload termination grace limits
 		IgnoreAllDaemonSets: true, // Prevents eviction loop lockups targeting itself
 		DeleteEmptyDirData:  true, // Drops ephemeral cache disks
+		Timeout:             config.DrainTimeout,
 		Out:                 slogwriter.New(logger, slog.LevelDebug),
 		ErrOut:              slogwriter.New(logger, slog.LevelError),
 	}
