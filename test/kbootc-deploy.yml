@@ -43,6 +43,15 @@ metadata:
   namespace: kube-system
 data:
   target_image: "localhost/kbootcd-test/rke2:almalinux10"
+---
+# Optional: uncomment and fill in to post drain/reboot/uncordon messages to Slack.
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: kbootcd-slack
+#   namespace: kube-system
+# stringData:
+#   token: xoxb-000-000-XXXX
 
 ---
 apiVersion: apps/v1
@@ -80,6 +89,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: SLACK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kbootcd-slack
+                  key: token
+                  optional: true
+            - name: SLACK_CHANNEL
+              value: "#kbootcd"
       volumes:
         - name: host-root
           hostPath:

@@ -40,3 +40,5 @@ Flags:
 ## Environment Variables
 
 - `NODE_NAME`: The name of the Kubernetes node the daemon is running on. Must be set to identify the node for API operations and the node drain process.
+- `SLACK_TOKEN`: Optional Slack bot token with the `chat:write` and `chat:write.customize` scopes (the latter lets messages post as `kbootcd`). When set, a message is posted before draining, before rebooting and after uncordoning a node.
+- `SLACK_CHANNEL`: Channel ID or name to post to. Required when `SLACK_TOKEN` is set.

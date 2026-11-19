@@ -63,6 +63,7 @@ var (
 	tickerInterval time.Duration
 	rebootDelay    time.Duration
 	cooldownDelay  time.Duration
+	drainTimeout   time.Duration
 	rebootDays     []string
 	rebootStart    string
 	rebootEnd      string
@@ -96,6 +97,7 @@ func main() {
 	rootCmd.Flags().DurationVar(&tickerInterval, "interval", 5*time.Minute, "How often to run the reconciliation loop")
 	rootCmd.Flags().DurationVar(&rebootDelay, "reboot-delay", 0, "Delay reboot for this duration")
 	rootCmd.Flags().DurationVar(&cooldownDelay, "cooldown-delay", 0, "Delay the release of the lease lock for this duration after a successful update")
+	rootCmd.Flags().DurationVar(&drainTimeout, "drain-timeout", 30*time.Minute, "Abort drain after this duration, 0 waits forever")
 
 	rootCmd.PersistentFlags().StringSliceVar(&rebootDays, "reboot-days", controller.EveryDay, "schedule reboot on these days")
 	rootCmd.PersistentFlags().StringVar(&rebootStart, "start-time", "0:00", "schedule reboot only after this time of day")
@@ -139,6 +141,9 @@ func run(ctx context.Context) error {
 		LeaseDuration:         leaseDuration,
 		RebootDelay:           rebootDelay,
 		CooldownDelay:         cooldownDelay,
+		DrainTimeout:          drainTimeout,
+		SlackToken:            os.Getenv("SLACK_TOKEN"),
+		SlackChannel:          os.Getenv("SLACK_CHANNEL"),
 	}
 
 	config.Window, err = controller.BuildTimeWindow(rebootStart, rebootEnd, rebootDays, timezone)
@@ -147,6 +152,12 @@ func run(ctx context.Context) error {
 	}
 
 	slog.Info("Starting kbootcd", "node", nodeName, "interval", tickerInterval.String())
+	if config.SlackToken != "" && config.SlackChannel == "" {
+		return fmt.Errorf("SLACK_CHANNEL must be set when SLACK_TOKEN is set")
+	}
+	if config.SlackToken != "" {
+		slog.Info("slack notifications enabled", "channel", config.SlackChannel)
+	}
 
 	cmder := command.NewCommander()
 	// Run immediate baseline check on startup
