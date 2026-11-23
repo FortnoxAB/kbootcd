@@ -12,6 +12,7 @@ import (
 
 	"github.com/elliot-gustafsson/kbootcd/internal/host"
 	"github.com/elliot-gustafsson/kbootcd/mocks/mock_command"
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -76,15 +77,12 @@ func TestReconcileWithUpToDateDigest(t *testing.T) {
 func TestReconcileWithRollbackUnstagesUnexpectedDigest(t *testing.T) {
 	tImage := "registry.example.com/os:v2.1.0@sha256:1111111111111111111111111111111111111111111111111111111111111111"
 
-	t.Run("post-switch staged is nil", func(t *testing.T) {
+	t.Run("switches back to booted digest without rebooting", func(t *testing.T) {
 		mockCmder := mock_command.NewMockCommander(t)
 		kubeMockClient := fake.NewSimpleClientset(newReadyNode("test001"))
 
 		initialStatus := MockBootcHost
 		initialStatus.Status.Staged = &MockStagedState
-
-		postSwitchStatus := MockBootcHost
-		postSwitchStatus.Status.Staged = nil
 
 		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
 			Once().
@@ -93,40 +91,6 @@ func TestReconcileWithRollbackUnstagesUnexpectedDigest(t *testing.T) {
 		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "switch", tImage)).
 			Once().
 			Return([]byte{}, nil)
-
-		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
-			Once().
-			Return(toJson(t, postSwitchStatus), nil)
-
-		config := NewTestConfig("test001", time.Now())
-		config.TargetImageConfigPath = createTempFile(t, tImage)
-
-		err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
-		assert.NoError(t, err)
-	})
-
-	t.Run("post-switch staged matches booted digest", func(t *testing.T) {
-		mockCmder := mock_command.NewMockCommander(t)
-		kubeMockClient := fake.NewSimpleClientset(newReadyNode("test001"))
-
-		initialStatus := MockBootcHost
-		initialStatus.Status.Staged = &MockStagedState
-
-		postSwitchStatus := MockBootcHost
-		bootedCopy := MockBootcHost.Status.Booted
-		postSwitchStatus.Status.Staged = &bootedCopy
-
-		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
-			Once().
-			Return(toJson(t, initialStatus), nil)
-
-		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "switch", tImage)).
-			Once().
-			Return([]byte{}, nil)
-
-		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
-			Once().
-			Return(toJson(t, postSwitchStatus), nil)
 
 		config := NewTestConfig("test001", time.Now())
 		config.TargetImageConfigPath = createTempFile(t, tImage)
@@ -154,15 +118,29 @@ func TestReconcileWithRollbackUnstagesUnexpectedDigest(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	t.Run("returns error if unexpected staged image remains after switch", func(t *testing.T) {
+	t.Run("still uncordons and releases lease after unstaging", func(t *testing.T) {
 		mockCmder := mock_command.NewMockCommander(t)
-		kubeMockClient := fake.NewSimpleClientset(newReadyNode("test001"))
+
+		node := newReadyNode("test001")
+		node.Spec.Unschedulable = true
+		holder := "test001"
+		lease := &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "bootc-upgrade-lock-test",
+				Namespace: "test",
+			},
+			Spec: coordinationv1.LeaseSpec{
+				HolderIdentity: &holder,
+				AcquireTime:    &metav1.MicroTime{Time: time.Now()},
+			},
+		}
+		kubeMockClient := fake.NewSimpleClientset(node, lease)
 
 		initialStatus := MockBootcHost
 		initialStatus.Status.Staged = &MockStagedState
 
 		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
-			Times(2).
+			Once().
 			Return(toJson(t, initialStatus), nil)
 
 		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "switch", tImage)).
@@ -173,7 +151,99 @@ func TestReconcileWithRollbackUnstagesUnexpectedDigest(t *testing.T) {
 		config.TargetImageConfigPath = createTempFile(t, tImage)
 
 		err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
-		assert.ErrorContains(t, err, "unexpected staged image")
+		assert.NoError(t, err)
+
+		updatedNode, err := kubeMockClient.CoreV1().Nodes().Get(context.Background(), "test001", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.False(t, updatedNode.Spec.Unschedulable)
+
+		updatedLease, err := kubeMockClient.CoordinationV1().Leases("test").Get(context.Background(), "bootc-upgrade-lock-test", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Nil(t, updatedLease.Spec.HolderIdentity)
+	})
+
+	t.Run("uses GetDigest when pinned image ref digest differs from platform ImageDigest", func(t *testing.T) {
+		mockCmder := mock_command.NewMockCommander(t)
+		kubeMockClient := fake.NewSimpleClientset(newReadyNode("test001"))
+
+		indexDigest := "registry.example.com/os@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		platformDigest := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+		bootedWithIndex := host.BootcState{
+			Image: host.StateImage{
+				Image: host.ContainerImage{
+					Image:     indexDigest,
+					Transport: "registry",
+				},
+				ImageDigest: platformDigest,
+			},
+		}
+
+		initialStatus := MockBootcHost
+		initialStatus.Status.Booted = bootedWithIndex
+		initialStatus.Status.Staged = &MockStagedState
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
+			Once().
+			Return(toJson(t, initialStatus), nil)
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "switch", indexDigest)).
+			Once().
+			Return([]byte{}, nil)
+
+		config := NewTestConfig("test001", time.Now())
+		config.TargetImageConfigPath = createTempFile(t, indexDigest)
+
+		err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
+		assert.NoError(t, err)
+	})
+}
+
+func TestReconcileWithStaleStagedDigestBlocksReboot(t *testing.T) {
+	desiredImage := "registry.example.com/os:v2.3.0@sha256:3333333333333333333333333333333333333333333333333333333333333333"
+
+	t.Run("stale staged digest does not match desired", func(t *testing.T) {
+		mockCmder := mock_command.NewMockCommander(t)
+		kubeMockClient := fake.NewSimpleClientset(newReadyNode("test001"))
+
+		// Stale v2.2.0 (2222...) is staged before AND still after bootc switch to v2.3.0 (3333...)
+		staleStatus := MockBootcHost
+		staleStatus.Status.Staged = &MockStagedState
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
+			Times(2).
+			Return(toJson(t, staleStatus), nil)
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "switch", desiredImage)).
+			Once().
+			Return([]byte{}, nil)
+
+		config := NewTestConfig("test001", time.Now())
+		config.TargetImageConfigPath = createTempFile(t, desiredImage)
+
+		err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
+		assert.ErrorContains(t, err, "does not match desired digest")
+	})
+
+	t.Run("nothing staged after switch for desired digest", func(t *testing.T) {
+		mockCmder := mock_command.NewMockCommander(t)
+		kubeMockClient := fake.NewSimpleClientset(newReadyNode("test001"))
+
+		bootcStatus := MockBootcHost
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
+			Times(2).
+			Return(toJson(t, bootcStatus), nil)
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "switch", desiredImage)).
+			Once().
+			Return([]byte{}, nil)
+
+		config := NewTestConfig("test001", time.Now())
+		config.TargetImageConfigPath = createTempFile(t, desiredImage)
+
+		err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
+		assert.ErrorContains(t, err, "nothing is staged")
 	})
 }
 
@@ -596,7 +666,7 @@ func TestGetRequiredAction(t *testing.T) {
 			name:     "booted matches desired, staged digest invalid",
 			status:   host.BootcStatus{Booted: bootedState, Staged: &invalidStagedState},
 			desired:  desiredBootedDigest,
-			expected: ActionStage,
+			expected: ActionNone,
 		},
 		{
 			name:     "booted differs, nothing staged",
@@ -632,9 +702,99 @@ func TestGetRequiredAction(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			action, err := getRequiredAction(&tt.status, tt.desired)
+			ref, err := name.ParseReference(tt.desired)
+			assert.NoError(t, err)
+			action, err := getRequiredAction(&tt.status, ref)
 			assert.NoError(t, err)
 			assert.Equal(t, tt.expected, action)
+		})
+	}
+}
+
+func TestShouldRebootAfterStage(t *testing.T) {
+	bootedState := MockBootcHost.Status.Booted
+	stagedOtherState := MockStagedState
+	stagedSameAsBooted := MockBootcHost.Status.Booted
+
+	index1 := "registry.example.com/os@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	index2 := "registry.example.com/os@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	sharedPlatformDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+	bootedIndex1 := host.BootcState{
+		Image: host.StateImage{
+			Image:       host.ContainerImage{Image: index1, Transport: "registry"},
+			ImageDigest: sharedPlatformDigest,
+		},
+	}
+	stagedIndex2 := host.BootcState{
+		Image: host.StateImage{
+			Image:       host.ContainerImage{Image: index2, Transport: "registry"},
+			ImageDigest: sharedPlatformDigest,
+		},
+	}
+
+	tests := []struct {
+		name           string
+		status         host.BootcStatus
+		desired        string
+		expectedReboot bool
+		expectErr      bool
+	}{
+		{
+			name:           "tag desired, nothing staged",
+			status:         host.BootcStatus{Booted: bootedState, Staged: nil},
+			desired:        "registry.example.com/os:v2.1.0",
+			expectedReboot: false,
+		},
+		{
+			name:           "tag desired, staged matches booted",
+			status:         host.BootcStatus{Booted: bootedState, Staged: &stagedSameAsBooted},
+			desired:        "registry.example.com/os:v2.1.0",
+			expectedReboot: false,
+		},
+		{
+			name:           "tag desired, new image staged",
+			status:         host.BootcStatus{Booted: bootedState, Staged: &stagedOtherState},
+			desired:        "registry.example.com/os:v2.2.0",
+			expectedReboot: true,
+		},
+		{
+			name:      "digest desired, nothing staged",
+			status:    host.BootcStatus{Booted: bootedState, Staged: nil},
+			desired:   "registry.example.com/os:v2.2.0@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+			expectErr: true,
+		},
+		{
+			name:      "digest desired, stale staged digest",
+			status:    host.BootcStatus{Booted: bootedState, Staged: &stagedOtherState},
+			desired:   "registry.example.com/os:v2.3.0@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+			expectErr: true,
+		},
+		{
+			name:           "digest desired, desired image staged",
+			status:         host.BootcStatus{Booted: bootedState, Staged: &stagedOtherState},
+			desired:        "registry.example.com/os:v2.2.0@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+			expectedReboot: true,
+		},
+		{
+			name:           "manifest-list digest differs even when platform ImageDigest matches",
+			status:         host.BootcStatus{Booted: bootedIndex1, Staged: &stagedIndex2},
+			desired:        index2,
+			expectedReboot: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ref, err := name.ParseReference(tt.desired)
+			assert.NoError(t, err)
+			reboot, err := shouldRebootAfterStage(&tt.status, ref)
+			if tt.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expectedReboot, reboot)
+			}
 		})
 	}
 }
