@@ -29,6 +29,7 @@ type RequiredAction uint8
 
 const (
 	ActionNone RequiredAction = iota
+	ActionStage
 	ActionReboot
 	ActionStageAndReboot
 )
@@ -38,7 +39,7 @@ func (a RequiredAction) None() bool {
 }
 
 func (a RequiredAction) Stage() bool {
-	return a == ActionStageAndReboot
+	return a == ActionStage || a == ActionStageAndReboot
 }
 
 func (a RequiredAction) Reboot() bool {
@@ -75,6 +76,11 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 	}
 	desiredImage := strings.TrimSpace(string(desiredBytes))
 
+	desiredImageReference, err := name.ParseReference(desiredImage)
+	if err != nil {
+		return fmt.Errorf("error parsing desired image reference, err: %w", err)
+	}
+
 	status, err := host.GetBootcHostStatus(ctx, cmder)
 	if err != nil {
 		return fmt.Errorf("error getting bootc status, err: %w", err)
@@ -91,7 +97,7 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 		"desired_image", desiredImage,
 	)
 
-	requiredAction, err := getRequiredAction(&status, desiredImage)
+	requiredAction, err := getRequiredAction(&status, desiredImageReference)
 	if err != nil {
 		return err
 	}
@@ -99,32 +105,32 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 	reboot := requiredAction.Reboot()
 
 	if requiredAction.Stage() {
-		logger.Info("staging base OS container update layers...")
+		if reboot {
+			logger.Info("staging base OS container update layers...")
+		} else {
+			logger.Info("unstaging unexpected staged OS image...")
+		}
+
 		if err := host.BootcSwitch(ctx, cmder, desiredImage); err != nil {
 			return fmt.Errorf("error executing bootc switch, err: %w", err)
 		}
 
-		// refetch status to get up to date status
-		postStageStatus, err := host.GetBootcHostStatus(ctx, cmder)
-		if err != nil {
-			return fmt.Errorf("error getting bootc status, err: %w", err)
-		}
-
 		if reboot {
 
-			switch {
-			case postStageStatus.Staged == nil:
-				// If noting is staged, skip reboot
-				reboot = false
-			case postStageStatus.Booted.Image.ImageDigest == postStageStatus.Staged.Image.ImageDigest:
-				// If staged image is same as booted, skip reboot
-				reboot = false
+			// refetch status to get up to date status
+			postStageStatus, err := host.GetBootcHostStatus(ctx, cmder)
+			if err != nil {
+				return fmt.Errorf("error getting bootc status, err: %w", err)
+			}
+
+			reboot, err = shouldRebootAfterStage(&postStageStatus, desiredImageReference)
+			if err != nil {
+				return err
 			}
 
 			if !reboot {
 				logger.Info("bootc switch completed but no new update was staged. Node is already up to date")
 			}
-
 		}
 	}
 
@@ -250,39 +256,76 @@ func notifySlack(ctx context.Context, logger *slog.Logger, config Config, text s
 	}
 }
 
-func getRequiredAction(status *host.BootcStatus, desired string) (RequiredAction, error) {
-	desiredReference, err := name.ParseReference(desired)
-	if err != nil {
-		return ActionNone, fmt.Errorf("error parsing desired image reference, err: %w", err)
-	}
+func getRequiredAction(status *host.BootcStatus, desired name.Reference) (RequiredAction, error) {
 
 	bootedDigest, err := status.Booted.Image.GetDigest()
 	if err != nil {
 		return ActionNone, fmt.Errorf("error parsing booted image digest, err: %w", err)
 	}
 
-	if d, ok := desiredReference.(name.Digest); ok {
-		if d.DigestStr() == bootedDigest.DigestStr() {
-			return ActionNone, nil
+	if d, ok := desired.(name.Digest); ok {
+		bootedMatchesDesired := d.DigestStr() == bootedDigest.DigestStr()
+
+		if status.Staged == nil {
+			if bootedMatchesDesired {
+				return ActionNone, nil
+			}
+			return ActionStageAndReboot, nil
 		}
 
-		if status.Staged != nil {
-			stagedDigest, err := status.Staged.Image.GetDigest()
-			if err != nil {
-				// Not fatal, just log and continue upgrade process
-				slog.Warn("error parsing staged image digest", "error", err.Error())
-				return ActionStageAndReboot, nil
+		stagedDigest, err := status.Staged.Image.GetDigest()
+		if err != nil {
+			// Not fatal, just log and continue upgrade process
+			slog.Warn("error parsing staged image digest", "error", err.Error())
+			if bootedMatchesDesired {
+				return ActionNone, nil
 			}
-
-			if d.DigestStr() == stagedDigest.DigestStr() {
-				// If the staged digest is the desired one, just reboot
-				return ActionReboot, nil
-			}
+			return ActionStageAndReboot, nil
 		}
+		stagedMatchesDesired := d.DigestStr() == stagedDigest.DigestStr()
+
+		if stagedMatchesDesired {
+			if bootedMatchesDesired {
+				return ActionNone, nil
+			}
+			return ActionReboot, nil
+		}
+
+		if bootedMatchesDesired {
+			// just re-stage the currently booted image
+			return ActionStage, nil
+		}
+
+		return ActionStageAndReboot, nil
 	}
 
 	// If the desired image isnt a digest we cannot be sure that we are up to date
 	return ActionStageAndReboot, nil
+}
+
+func shouldRebootAfterStage(status *host.BootcStatus, desired name.Reference) (bool, error) {
+	if status.Staged == nil {
+		if d, ok := desired.(name.Digest); ok {
+			return false, fmt.Errorf("expected image %s to be staged after bootc switch, but nothing is staged", d.DigestStr())
+		}
+		return false, nil
+	}
+
+	stagedDigest, err := status.Staged.Image.GetDigest()
+	if err != nil {
+		return false, fmt.Errorf("error parsing staged image digest after bootc switch, err: %w", err)
+	}
+
+	if d, ok := desired.(name.Digest); ok && stagedDigest.DigestStr() != d.DigestStr() {
+		return false, fmt.Errorf("staged image digest %s does not match desired digest %s", stagedDigest.DigestStr(), d.DigestStr())
+	}
+
+	bootedDigest, err := status.Booted.Image.GetDigest()
+	if err != nil {
+		return false, fmt.Errorf("error parsing booted image digest, err: %w", err)
+	}
+
+	return bootedDigest.DigestStr() != stagedDigest.DigestStr(), nil
 }
 
 func isClusterHealthy(ctx context.Context, kube kubernetes.Interface, ourNodeName string) (bool, error) {

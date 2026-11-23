@@ -1,4 +1,4 @@
-.PHONY:	build
+.PHONY:	build test
 SHELL := /bin/bash
 MAKEFLAGS += --no-print-directory
 
