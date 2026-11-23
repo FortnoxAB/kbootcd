@@ -26,23 +26,36 @@ func TestMain(m *testing.M) {
 		Level: slog.LevelError,
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, opts)))
+	os.Exit(m.Run())
 }
 
-func TestReconcileWithUpToDateDigest(t *testing.T) {
-	mockCmder := mock_command.NewMockCommander(t)
-
-	node := &corev1.Node{
+func newReadyNode(name string) *corev1.Node {
+	return &corev1.Node{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
 			Kind:       "Node",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "test001",
+			Name: name,
 		},
 		Spec: corev1.NodeSpec{
 			Unschedulable: false,
 		},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
+				{
+					Type:   corev1.NodeReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
 	}
+}
+
+func TestReconcileWithUpToDateDigest(t *testing.T) {
+	mockCmder := mock_command.NewMockCommander(t)
+
+	node := newReadyNode("test001")
 
 	kubeMockClient := fake.NewSimpleClientset(node)
 
@@ -60,21 +73,114 @@ func TestReconcileWithUpToDateDigest(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestReconcileWithRollbackUnstagesUnexpectedDigest(t *testing.T) {
+	tImage := "registry.example.com/os:v2.1.0@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
+	t.Run("post-switch staged is nil", func(t *testing.T) {
+		mockCmder := mock_command.NewMockCommander(t)
+		kubeMockClient := fake.NewSimpleClientset(newReadyNode("test001"))
+
+		initialStatus := MockBootcHost
+		initialStatus.Status.Staged = &MockStagedState
+
+		postSwitchStatus := MockBootcHost
+		postSwitchStatus.Status.Staged = nil
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
+			Once().
+			Return(toJson(t, initialStatus), nil)
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "switch", tImage)).
+			Once().
+			Return([]byte{}, nil)
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
+			Once().
+			Return(toJson(t, postSwitchStatus), nil)
+
+		config := NewTestConfig("test001", time.Now())
+		config.TargetImageConfigPath = createTempFile(t, tImage)
+
+		err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
+		assert.NoError(t, err)
+	})
+
+	t.Run("post-switch staged matches booted digest", func(t *testing.T) {
+		mockCmder := mock_command.NewMockCommander(t)
+		kubeMockClient := fake.NewSimpleClientset(newReadyNode("test001"))
+
+		initialStatus := MockBootcHost
+		initialStatus.Status.Staged = &MockStagedState
+
+		postSwitchStatus := MockBootcHost
+		bootedCopy := MockBootcHost.Status.Booted
+		postSwitchStatus.Status.Staged = &bootedCopy
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
+			Once().
+			Return(toJson(t, initialStatus), nil)
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "switch", tImage)).
+			Once().
+			Return([]byte{}, nil)
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
+			Once().
+			Return(toJson(t, postSwitchStatus), nil)
+
+		config := NewTestConfig("test001", time.Now())
+		config.TargetImageConfigPath = createTempFile(t, tImage)
+
+		err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
+		assert.NoError(t, err)
+	})
+
+	t.Run("no-op when staged already matches booted and desired digest", func(t *testing.T) {
+		mockCmder := mock_command.NewMockCommander(t)
+		kubeMockClient := fake.NewSimpleClientset(newReadyNode("test001"))
+
+		bootcStatus := MockBootcHost
+		bootedCopy := MockBootcHost.Status.Booted
+		bootcStatus.Status.Staged = &bootedCopy
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
+			Once().
+			Return(toJson(t, bootcStatus), nil)
+
+		config := NewTestConfig("test001", time.Now())
+		config.TargetImageConfigPath = createTempFile(t, tImage)
+
+		err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
+		assert.NoError(t, err)
+	})
+
+	t.Run("returns error if unexpected staged image remains after switch", func(t *testing.T) {
+		mockCmder := mock_command.NewMockCommander(t)
+		kubeMockClient := fake.NewSimpleClientset(newReadyNode("test001"))
+
+		initialStatus := MockBootcHost
+		initialStatus.Status.Staged = &MockStagedState
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
+			Times(2).
+			Return(toJson(t, initialStatus), nil)
+
+		mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "switch", tImage)).
+			Once().
+			Return([]byte{}, nil)
+
+		config := NewTestConfig("test001", time.Now())
+		config.TargetImageConfigPath = createTempFile(t, tImage)
+
+		err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
+		assert.ErrorContains(t, err, "unexpected staged image")
+	})
+}
+
 func TestReconcileWithOutOfDateDigest(t *testing.T) {
 	mockCmder := mock_command.NewMockCommander(t)
 
-	node := &corev1.Node{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "v1",
-			Kind:       "Node",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "test001",
-		},
-		Spec: corev1.NodeSpec{
-			Unschedulable: false,
-		},
-	}
+	node := newReadyNode("test001")
 
 	kubeMockClient := fake.NewSimpleClientset(node)
 
@@ -104,24 +210,13 @@ func TestReconcileWithOutOfDateDigest(t *testing.T) {
 	config.TargetImageConfigPath = createTempFile(t, tImage)
 
 	err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, ErrRebootInitiated)
 }
 
 func TestReconcileWithUpToDateTag(t *testing.T) {
 	mockCmder := mock_command.NewMockCommander(t)
 
-	node := &corev1.Node{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "v1",
-			Kind:       "Node",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "test001",
-		},
-		Spec: corev1.NodeSpec{
-			Unschedulable: false,
-		},
-	}
+	node := newReadyNode("test001")
 
 	kubeMockClient := fake.NewSimpleClientset(node)
 
@@ -146,18 +241,7 @@ func TestReconcileWithUpToDateTag(t *testing.T) {
 func TestReconcileWithOutOfDateTag(t *testing.T) {
 	mockCmder := mock_command.NewMockCommander(t)
 
-	node := &corev1.Node{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "v1",
-			Kind:       "Node",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "test001",
-		},
-		Spec: corev1.NodeSpec{
-			Unschedulable: false,
-		},
-	}
+	node := newReadyNode("test001")
 
 	kubeMockClient := fake.NewSimpleClientset(node)
 
@@ -187,7 +271,7 @@ func TestReconcileWithOutOfDateTag(t *testing.T) {
 	config.TargetImageConfigPath = createTempFile(t, tImage)
 
 	err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, ErrRebootInitiated)
 }
 
 func TestReconcileWithLeaseConflict(t *testing.T) {
@@ -195,18 +279,7 @@ func TestReconcileWithLeaseConflict(t *testing.T) {
 
 	holder := "test002"
 	objects := []runtime.Object{
-		&corev1.Node{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: "v1",
-				Kind:       "Node",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "test001",
-			},
-			Spec: corev1.NodeSpec{
-				Unschedulable: false,
-			},
-		},
+		newReadyNode("test001"),
 		&coordinationv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "bootc-upgrade-lock-test",
@@ -403,18 +476,7 @@ func TestReconcileWithMaintenanceWindow(t *testing.T) {
 
 			mockCmder := mock_command.NewMockCommander(t)
 
-			node := &corev1.Node{
-				TypeMeta: metav1.TypeMeta{
-					APIVersion: "v1",
-					Kind:       "Node",
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test001",
-				},
-				Spec: corev1.NodeSpec{
-					Unschedulable: false,
-				},
-			}
+			node := newReadyNode("test001")
 
 			kubeMockClient := fake.NewSimpleClientset(node)
 
@@ -449,10 +511,132 @@ func TestReconcileWithMaintenanceWindow(t *testing.T) {
 			assert.NoError(t, err)
 
 			err = Reconcile(context.Background(), mockCmder, kubeMockClient, config)
-			assert.NoError(t, err)
+			if tt.reboot {
+				assert.ErrorIs(t, err, ErrRebootInitiated)
+			} else {
+				assert.NoError(t, err)
+			}
 		})
 	}
 
+}
+
+func TestReconcileWithRollbackTag(t *testing.T) {
+	mockCmder := mock_command.NewMockCommander(t)
+	kubeMockClient := fake.NewSimpleClientset(newReadyNode("test001"))
+
+	initialStatus := MockBootcHost
+	initialStatus.Status.Staged = &MockStagedState
+
+	postSwitchStatus := MockBootcHost
+	bootedCopy := MockBootcHost.Status.Booted
+	postSwitchStatus.Status.Staged = &bootedCopy
+
+	mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
+		Once().
+		Return(toJson(t, initialStatus), nil)
+
+	mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "switch", "registry.example.com/os:v2.1.0")).
+		Once().
+		Return([]byte{}, nil)
+
+	mockCmder.EXPECT().Run(mock.Anything, "nsenter", append(nsenterOpts, "bootc", "status", "--json")).
+		Once().
+		Return(toJson(t, postSwitchStatus), nil)
+
+	config := NewTestConfig("test001", time.Now())
+	config.TargetImageConfigPath = createTempFile(t, "registry.example.com/os:v2.1.0")
+
+	err := Reconcile(context.Background(), mockCmder, kubeMockClient, config)
+	assert.NoError(t, err)
+}
+
+func TestGetRequiredAction(t *testing.T) {
+	bootedState := MockBootcHost.Status.Booted
+	stagedOtherState := MockStagedState
+	stagedSameAsBooted := MockBootcHost.Status.Booted
+	invalidStagedState := host.BootcState{
+		Image: host.StateImage{
+			Image: host.ContainerImage{
+				Image: "registry.example.com/os:v2.2.0",
+			},
+			ImageDigest: "not-a-digest",
+		},
+	}
+
+	desiredBootedDigest := "registry.example.com/os:v2.1.0@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	desiredStagedDigest := "registry.example.com/os:v2.2.0@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+	desiredNewDigest := "registry.example.com/os:v2.3.0@sha256:3333333333333333333333333333333333333333333333333333333333333333"
+
+	tests := []struct {
+		name     string
+		status   host.BootcStatus
+		desired  string
+		expected RequiredAction
+	}{
+		{
+			name:     "booted matches desired, nothing staged",
+			status:   host.BootcStatus{Booted: bootedState, Staged: nil},
+			desired:  desiredBootedDigest,
+			expected: ActionNone,
+		},
+		{
+			name:     "booted matches desired, staged also matches desired",
+			status:   host.BootcStatus{Booted: bootedState, Staged: &stagedSameAsBooted},
+			desired:  desiredBootedDigest,
+			expected: ActionNone,
+		},
+		{
+			name:     "rollback: booted matches desired, unexpected image staged",
+			status:   host.BootcStatus{Booted: bootedState, Staged: &stagedOtherState},
+			desired:  desiredBootedDigest,
+			expected: ActionStage,
+		},
+		{
+			name:     "booted matches desired, staged digest invalid",
+			status:   host.BootcStatus{Booted: bootedState, Staged: &invalidStagedState},
+			desired:  desiredBootedDigest,
+			expected: ActionStage,
+		},
+		{
+			name:     "booted differs, nothing staged",
+			status:   host.BootcStatus{Booted: bootedState, Staged: nil},
+			desired:  desiredStagedDigest,
+			expected: ActionStageAndReboot,
+		},
+		{
+			name:     "booted differs, staged matches desired",
+			status:   host.BootcStatus{Booted: bootedState, Staged: &stagedOtherState},
+			desired:  desiredStagedDigest,
+			expected: ActionReboot,
+		},
+		{
+			name:     "booted differs, staged differs from desired",
+			status:   host.BootcStatus{Booted: bootedState, Staged: &stagedOtherState},
+			desired:  desiredNewDigest,
+			expected: ActionStageAndReboot,
+		},
+		{
+			name:     "booted differs, staged digest invalid",
+			status:   host.BootcStatus{Booted: bootedState, Staged: &invalidStagedState},
+			desired:  desiredStagedDigest,
+			expected: ActionStageAndReboot,
+		},
+		{
+			name:     "desired is tag",
+			status:   host.BootcStatus{Booted: bootedState, Staged: nil},
+			desired:  "registry.example.com/os:v2.1.0",
+			expected: ActionStageAndReboot,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action, err := getRequiredAction(&tt.status, tt.desired)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expected, action)
+		})
+	}
 }
 
 // ##########################################

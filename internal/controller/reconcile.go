@@ -28,6 +28,7 @@ type RequiredAction uint8
 
 const (
 	ActionNone RequiredAction = iota
+	ActionStage
 	ActionReboot
 	ActionStageAndReboot
 )
@@ -37,7 +38,7 @@ func (a RequiredAction) None() bool {
 }
 
 func (a RequiredAction) Stage() bool {
-	return a == ActionStageAndReboot
+	return a == ActionStage || a == ActionStageAndReboot
 }
 
 func (a RequiredAction) Reboot() bool {
@@ -121,6 +122,8 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 				logger.Info("bootc switch completed but no new update was staged. Node is already up to date")
 			}
 
+		} else if postStageStatus.Staged != nil && postStageStatus.Booted.Image.ImageDigest != postStageStatus.Staged.Image.ImageDigest {
+			return fmt.Errorf("unexpected staged image %s remains after bootc switch", postStageStatus.Staged.Image.ImageDigest)
 		}
 	}
 
@@ -239,23 +242,37 @@ func getRequiredAction(status *host.BootcStatus, desired string) (RequiredAction
 	}
 
 	if d, ok := desiredReference.(name.Digest); ok {
-		if d.DigestStr() == bootedDigest.DigestStr() {
-			return ActionNone, nil
+		bootedMatchesDesired := d.DigestStr() == bootedDigest.DigestStr()
+
+		if status.Staged == nil {
+			if bootedMatchesDesired {
+				return ActionNone, nil
+			}
+			return ActionStageAndReboot, nil
 		}
 
-		if status.Staged != nil {
-			stagedDigest, err := status.Staged.Image.GetDigest()
-			if err != nil {
-				// Not fatal, just log and continue upgrade process
-				slog.Warn("error parsing staged image digest", "error", err.Error())
-				return ActionStageAndReboot, nil
-			}
-
-			if d.DigestStr() == stagedDigest.DigestStr() {
-				// If the staged digest is the desired one, just reboot
-				return ActionReboot, nil
-			}
+		var stagedMatchesDesired bool
+		stagedDigest, err := status.Staged.Image.GetDigest()
+		if err != nil {
+			// Not fatal, just log and continue upgrade process
+			slog.Warn("error parsing staged image digest", "error", err.Error())
+		} else {
+			stagedMatchesDesired = d.DigestStr() == stagedDigest.DigestStr()
 		}
+
+		if stagedMatchesDesired {
+			if bootedMatchesDesired {
+				return ActionNone, nil
+			}
+			return ActionReboot, nil
+		}
+
+		if bootedMatchesDesired {
+			// just re-stage the currently booted image
+			return ActionStage, nil
+		}
+
+		return ActionStageAndReboot, nil
 	}
 
 	// If the desired image isnt a digest we cannot be sure that we are up to date
